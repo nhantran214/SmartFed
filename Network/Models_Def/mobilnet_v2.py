@@ -62,7 +62,8 @@ class MobileNetV2(nn.Module):
             self.conv2,
             self.bn2,
             nn.ReLU(),
-            nn.AvgPool2d(kernel_size=4)
+            # Adaptive pool: works for CIFAR (32) and GenImage (224).
+            nn.AdaptiveAvgPool2d((1, 1)),
         )
         self.linear = nn.Linear(1280, num_classes)
 

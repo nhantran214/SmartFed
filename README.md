@@ -1,14 +1,17 @@
 # SmartFed
 
-SmartFed is a federated learning codebase focused on deepfake detection and related benchmarks. Clients use a shared **EfficientNet-B0** image backbone (`torchvision`). It supports **GenImage** (binary real/fake, non-IID across clients) and **CIFAR-10** (10-way classification, IID-style splits), plus optional utilities for other datasets. The main training entry point is `main.py`; a **FedAvg-only** script is `train_fedavg.py`.
+SmartFed is a federated learning codebase focused on deepfake detection and related benchmarks. It supports two FL **protocols** (homogeneous vs heterogeneous client backbones), **GenImage** (binary real/fake, non-IID across clients), **CIFAR-10**, and related utilities. The main training entry point is `main.py`; a **FedAvg-only** script is `train_fedavg.py`.
 
-This file is the **only** project documentation: setup, data layout, Ollama/LLM features, and testing.
+This file is the project documentation: setup, data layout, Ollama/LLM features, and the experiment runners under `scripts/`.
+
+Datasets, logs, and checkpoints are **not** in the git repository. Clone the code, place data on disk, then run `pretrain.py` before `main.py`. Paths and round counts are overridden with `SMARTFED_*` environment variables (see [CIFAR-10 agent modes](#cifar-10-client-selection-and-loss-weighting)); `config.py` only chooses GenImage (`config_genimage.py`) or CIFAR-10 (`config_cifar.py`).
 
 ---
 
 ## Features
 
-- **Backbone**: **EfficientNet-B0** from `torchvision` for all clients (see `config.py` → `PRIVATE_NETS_NAME_LIST` / `NETS_NAME_LIST`, and `Dataset/utils.py` → `init_nets`). Image inputs are resized to **224×224** for GenImage-style loaders.
+- **Protocols** (`config.py` → **`PROTOCOL`**): **`Homo_FL`**, **`Hete_FL`**, or **`Homo_ServerGSAM`** (GSAM also updates server party 0; see [FL protocols](#fl-protocols-homo_fl--hete_fl--homo_servergsam)).
+- **Backbones**: EfficientNet-B0 (`torchvision`), plus ResNet10 / ResNet12 / MobileNetV2 for Hete_FL (`Dataset/utils.py` → `init_nets`). GenImage-style inputs are **224×224**.
 - **Hybrid federated training** (`main.py`): private client data, public data where configured, logging, and checkpoints under `Model_Storage/` and `Logs/`.
 - **Learnable client weights** (`main.py`): per-client `weight_quality` updated with gradient descent across communication rounds (see [Client aggregation weights](#client-aggregation-weights-weight_quality)).
 - **FedAvg** (`train_fedavg.py`): federated averaging using the same `config.py` and dataloaders.
@@ -27,19 +30,83 @@ Use a **GPU** when possible. PyTorch and torchvision are required (EfficientNet-
 
 ---
 
+## FL protocols (`Homo_FL` / `Hete_FL` / `Homo_ServerGSAM`)
+
+Set **`PROTOCOL`** near the top of `Config` in `config.py`. This chooses how **`PRIVATE_NETS_NAME_LIST`** / **`NETS_NAME_LIST`** are filled (after **`N_CLIENTS`** is known from the dataset branch), and whether GSAM updates the server.
+
+| Protocol | Meaning | Backbones | GSAM parties |
+|----------|---------|-----------|--------------|
+| **`Homo_FL`** (default) | Homogeneous FL | All parties: **`EfficientNetB0`** | Clients **1..N** only |
+| **`Hete_FL`** | Heterogeneous FL | Server: EfficientNetB0; clients round-robin **`HETE_BACKBONE_POOL`** | Clients **1..N** only |
+| **`Homo_ServerGSAM`** | Homogeneous + server local update | All parties: **`EfficientNetB0`** | **0** (on `genimage_pub`) **and** clients **1..N** |
+
+### Party layout (GenImage / DiffusionFace)
+
+With **`HAS_SERVER_TEACHER = True`** (default for GenImage):
+
+| Party id | Role | Data |
+|----------|------|------|
+| **0** | **Server teacher** (shared at server) | `PUBLIC_DATASET_DIR` → `genimage_pub` |
+| **1 .. N_CLIENTS** | Private **clients** | `DATASET_LIST[0 .. N_CLIENTS-1]` (e.g. `adm` … `wukong`) |
+
+So for GenImage: **`N_CLIENTS = 8`**, **`N_PARTIES = 9`**, checkpoints `EfficientNetB0_0.ckpt` … `_8.ckpt`.  
+Public KL uses party **0** as the frozen teacher during the KL window; under **`Homo_FL` / `Hete_FL`**, GSAM / local updates run on parties **1–8** only. Under **`Homo_ServerGSAM`**, GSAM also fine-tunes party **0** on `genimage_pub` every round (after KL).
+
+**Communication topology (star only):** each round the server updates with **one client at a time** — pairs `(0,1), (0,2), …, (0,8)`. Soft labels and weight/KL updates never go client↔client (e.g. no `1↔2`).
+
+### Assignment example (GenImage, `N_CLIENTS = 8` → parties 0–8)
+
+**Homo_FL** / **Homo_ServerGSAM:**
+
+```text
+party 0 (server teacher, genimage_pub) → EfficientNetB0
+party 1..8 (clients adm..wukong)     → EfficientNetB0
+```
+
+**Hete_FL** (server teacher fixed to EfficientNetB0; clients round-robin the pool):
+
+```text
+party 0 → EfficientNetB0   # server teacher
+party 1 → EfficientNetB0   # adm
+party 2 → ResNet10
+party 3 → ResNet12
+party 4 → Mobilenetv2
+party 5 → EfficientNetB0
+party 6 → ResNet10
+party 7 → ResNet12
+party 8 → Mobilenetv2
+```
+
+Customize the cycle by editing **`HETE_BACKBONE_POOL`** in `config.py` (names must match `init_nets` in `Dataset/utils.py`).
+
+### How to run each protocol
+
+1. Set **`PROTOCOL = 'Homo_FL'`**, **`'Hete_FL'`**, or **`'Homo_ServerGSAM'`** in `config.py`.
+2. Keep **`DATASET_TYPE`**, paths, and **`N_CLIENTS`** as usual.
+3. Run **`pretrain.py`** with that protocol so each **party** writes the matching checkpoint, e.g.  
+   `Model_Storage/CE/None0/EfficientNetB0_0.ckpt` (server teacher on `genimage_pub`), `…_1.ckpt` (first client), …
+4. Run **`main.py`** (or **`train_fedavg.py`**) with the **same** **`PROTOCOL`** so load/save names align.
+
+Switching protocol without re-pretraining will look for the wrong `.ckpt` filenames.  
+**Re-pretrain after this party-layout change** — old `*_0.ckpt` was `adm`, now `*_0.ckpt` is the server teacher on `genimage_pub`.  
+`Homo_FL` ↔ `Homo_ServerGSAM` share the same checkpoint names (both EfficientNetB0); only the GSAM party set differs at runtime.
+
+Public KL distillation still works across architectures because alignment is on **logits** (same `OUTPUT_CHANNEL`), not shared weights.
+
+---
+
 ## Quick start
 
-1. **Configure `config.py`** — follow [Declaring `config.py` for a successful run](#declaring-configpy-for-a-successful-run) so dataset paths, client count, and model settings match your machine and data layout.
+1. **Configure `config.py`** — set **`PROTOCOL`**, then follow [Declaring `config.py` for a successful run](#declaring-configpy-for-a-successful-run) so dataset paths, client count, and model settings match your machine and data layout.
 2. Prepare data on disk as in [Dataset layout on disk](#dataset-layout-on-disk) (paths must match what you set under `PRIVATE_DATASET_DIR` / `PUBLIC_DATASET_DIR`).
-3. Optional pretraining:
+3. Pretraining (required for `main.py` with matching protocol):
 
    ```bash
    python pretrain.py
    ```
 
 4. Main training:
-   The main.py file will be released after the paper is officially accepted.
-   
+
    ```bash
    python main.py
    ```
@@ -54,7 +121,7 @@ Use a **GPU** when possible. PyTorch and torchvision are required (EfficientNet-
 
 ## Declaring `config.py` for a successful run
 
-All training scripts (`main.py`, `pretrain.py`, `train_fedavg.py`) read the **`Config`** class in `config.py`. There is no separate YAML or CLI override: **anything you need to change for your environment should be edited in this file.**
+All training scripts (`main.py`, `pretrain.py`, `train_fedavg.py`) read the **`Config`** class. `config.py` loads **`config_genimage.py`** by default and **`config_cifar.py`** when `SMARTFED_CONFIG=cifar` or `SMARTFED_DATASET_TYPE=cifar10`. Most experiment knobs (`PROTOCOL`, `N_CLIENTS`, `COMMUNICATION_EPOCH`, `WEIGHT_RULE`, dataset directories, agent mode) are `SMARTFED_*` environment variables with the defaults in those two files. Edit a file only for a default you want to keep.
 
 ### 1. How `config.py` is structured
 
@@ -69,13 +136,14 @@ To use data **outside** the repo, replace the `os.path.join(_SMARTFED_ROOT, ...)
 
 | Step | What to verify |
 |------|----------------|
-| Dataset mode | Set **`DATASET_TYPE`** to `'genimage'` or `'cifar10'`. |
+| Protocol | Set **`PROTOCOL`** to `'Homo_FL'`, `'Hete_FL'`, or `'Homo_ServerGSAM'` (see [FL protocols](#fl-protocols-homo_fl--hete_fl--homo_servergsam)). |
+| Dataset mode | Set **`DATASET_TYPE`** to `'genimage'`, `'diffusionface'`, or `'cifar10'`. |
 | Data on disk | Folders exist and match [Dataset layout on disk](#dataset-layout-on-disk) for the chosen mode. |
 | Paths | **`PRIVATE_DATASET_DIR`** and **`PUBLIC_DATASET_DIR`** (in the active `if` / `elif` branch) point to those folders. |
 | Client count | **`N_CLIENTS`** equals the number of clients you train; for GenImage it must match **`len(DATASET_LIST)`**. |
 | Classes vs model | **`OUTPUT_CHANNEL`** and **`PRIVATE_OUTPUT_CHANNEL`** equal `len(PRIVATE_DATASET_CLASSES)` (2 for GenImage, 10 for CIFAR-10 as shipped). |
-| Network names | **`PRIVATE_NETS_NAME_LIST`** and **`NETS_NAME_LIST`** each have length **`N_CLIENTS`**. The default setup uses **`EfficientNetB0`** for every client; names are resolved in `Dataset/utils.py` → `init_nets`. |
-| `main.py` checkpoints | **`main.py`** expects per-client checkpoints under **`Model_Storage/...`** (see §7). Run **`pretrain.py`** first with matching settings, or place `.ckpt` files manually. **`train_fedavg.py`** starts from freshly initialized nets (no `Model_Storage` load unless you change the code). |
+| Network names | **`PRIVATE_NETS_NAME_LIST`** / **`NETS_NAME_LIST`** are filled from **`PROTOCOL`** (length **`N_CLIENTS`**). Resolved in `Dataset/utils.py` → `init_nets`. |
+| `main.py` checkpoints | **`main.py`** expects per-client checkpoints under **`Model_Storage/...`** (see §7). Run **`pretrain.py`** first with the **same `PROTOCOL`**, or place `.ckpt` files manually. **`train_fedavg.py`** starts from freshly initialized nets (no `Model_Storage` load unless you change the code). |
 
 ---
 
@@ -85,6 +153,7 @@ These apply regardless of dataset (see `config.py` for current numeric defaults)
 
 | Variable | Meaning |
 |----------|---------|
+| **`PROTOCOL`** | `'Homo_FL'`, `'Hete_FL'`, or `'Homo_ServerGSAM'` — backbone layout + whether GSAM updates the server (see [FL protocols](#fl-protocols-homo_fl--hete_fl--homo_servergsam)). |
 | **`SEED`** | Random seed for NumPy / PyTorch (reproducibility). |
 | **`N_CLIENTS`** | Number of federated clients; loops in `main.py` / `pretrain.py` / `train_fedavg.py` iterate `0 .. N_CLIENTS-1`. |
 | **`TRAIN_BATCH_SIZE`** | Batch size for **public** data loaders (where used with public train/test). |
@@ -120,14 +189,18 @@ These appear in dataloader calls and in **checkpoint directory names** (see §7)
 
 ---
 
-### 6. Model architecture lists
+### 6. Model architecture lists (driven by `PROTOCOL`)
+
+Do **not** hand-edit **`PRIVATE_NETS_NAME_LIST`** / **`NETS_NAME_LIST`** unless you know what you are doing — they are set automatically from **`PROTOCOL`**:
 
 | Variable | Meaning |
 |----------|---------|
-| **`PRIVATE_NETS_NAME_LIST`** | Length **`N_CLIENTS`**: per-client architecture for private models and checkpoint filenames. Default: **`['EfficientNetB0'] * N_CLIENTS`**. |
-| **`NETS_NAME_LIST`** | Same length; used when building participant nets in pretrain / FedAvg. Keep aligned with **`PRIVATE_NETS_NAME_LIST`**. |
+| **`PROTOCOL`** | `'Homo_FL'` → all **`EfficientNetB0`**. `'Hete_FL'` → round-robin over **`HETE_BACKBONE_POOL`**. |
+| **`HETE_BACKBONE_POOL`** | Backbone names used only when **`PROTOCOL == 'Hete_FL'`**. Default: `EfficientNetB0`, `ResNet10`, `ResNet12`, `Mobilenetv2`. |
+| **`PRIVATE_NETS_NAME_LIST`** | Length **`N_CLIENTS`**: per-client architecture and checkpoint filename stem. |
+| **`NETS_NAME_LIST`** | Copy of **`PRIVATE_NETS_NAME_LIST`**; used by `pretrain.py` / `train_fedavg.py` when calling `init_nets`. |
 
-Additional architectures (`ResNet10`, `EfficientNetB4`, etc.) exist in **`Dataset/utils.py`** → **`init_nets`** for experiments, but **SmartFed is intended to run with EfficientNet-B0**.
+Supported names in **`Dataset/utils.py`** → **`init_nets`**: `EfficientNetB0`, `EfficientNetB4`, `ResNet10`, `ResNet12`, `Mobilenetv2` (aliases `MobileNetV2` / `MobileNetv2`), `ShuffleNet`.
 
 ---
 
@@ -136,13 +209,14 @@ Additional architectures (`ResNet10`, `EfficientNetB4`, etc.) exist in **`Datase
 **`pretrain.py`** writes:
 
 - Per-client:  
-  `Model_Storage/<PARTICIPANT_PARAMS['loss_function']>/<NOISE_TYPE><NOISE_RATE>/<PRIVATE_NETS_NAME_LIST[i]>_<i>.ckpt`
+  `Model_Storage/<PARTICIPANT_PARAMS['loss_function']>/<NOISE_TYPE><NOISE_RATE>/<PRIVATE_NETS_NAME_LIST[i]>_<i>.ckpt`  
+  Examples: `EfficientNetB0_0.ckpt` (Homo_FL), or `ResNet10_1.ckpt` / `Mobilenetv2_3.ckpt` (Hete_FL).
 - Optional public model path used in pretrain:  
   `.../public_model.ckpt` under the same `<loss>/<noise>` folder.
 
 **`main.py`** loads each client’s checkpoint from the **same pattern** before continuing training. So for a successful **`main.py`** run you must either:
 
-1. Run **`pretrain.py`** first with the **same** `PARTICIPANT_PARAMS`, `NOISE_TYPE`, `NOISE_RATE`, `PRIVATE_NETS_NAME_LIST`, and `N_CLIENTS`, or  
+1. Run **`pretrain.py`** first with the **same** `PROTOCOL`, `PARTICIPANT_PARAMS`, `NOISE_TYPE`, `NOISE_RATE`, and `N_CLIENTS`, or  
 2. Place compatible `.ckpt` files at those paths manually.
 
 If any path segment does not match, you will get a **file not found** error at startup.
@@ -155,17 +229,19 @@ Set **`DATASET_TYPE = 'genimage'`** at the top of the dataset block. The followi
 
 | Variable | You must ensure |
 |----------|------------------|
-| **`DATASET_LIST`** | List of **subdirectory names** under **`PRIVATE_DATASET_DIR`**, one per client, length **`N_CLIENTS`**. Default lists eight generator folders (`adm`, `BigGAN`, …). Each must contain `train/nature`, `train/ai`, `val/nature`, `val/ai`. |
+| **`DATASET_LIST`** | List of **subdirectory names** under **`PRIVATE_DATASET_DIR`**, one per **client**, length **`N_CLIENTS`**. Default: eight generator folders (`adm`, `BigGAN`, …). Each must contain `train/nature`, `train/ai`, `val/nature`, `val/ai`. Mapped to parties **1 .. N_CLIENTS**. |
 | **`PRIVATE_DATASET_DIR`** | Parent directory of all client folders. Default: `<repo>/data/genimage_medium_fulltest`. |
 | **`PRIVATE_DATASET_NAME`** | Must stay **`'genimage'`** for the current `genimage` loader. |
 | **`PRIVATE_DATA_LEN`** | Used when **`INTRA_DATASET`** is `True` (cap on indices per client). For `False`, behavior depends on full dataset size. |
 | **`PRIVATE_DATASET_CLASSES`** | **`['real', 'fake']`** → binary classification; must match **`OUTPUT_CHANNEL` / `PRIVATE_OUTPUT_CHANNEL`**. |
 | **`OUTPUT_CHANNEL`**, **`PRIVATE_OUTPUT_CHANNEL`** | Set to **`len(PRIVATE_DATASET_CLASSES)`** (2). |
-| **`PUBLIC_DATASET_NAME`** | **`'genimage'`** for the public loader. |
-| **`PUBLIC_DATASET_DIR`** | Default: `<repo>/data/genimage_medium_fulltest/genimage_pub` with the **same** folder layout as a single client root. |
+| **`PUBLIC_DATASET_NAME`** | **`'genimage'`** for the public / server-teacher loader. |
+| **`PUBLIC_DATASET_DIR`** | **`…/genimage_pub`** — data for **party 0 (server teacher)** and for Public KL soft targets. Same folder layout as a client root. |
 | **`PUBLIC_DATASET_LENGTH`** | Size hint / subsampling for public data where the training code uses it (default `8000`). |
+| **`HAS_SERVER_TEACHER`** | **`True`**: party 0 = server teacher; **`N_PARTIES = N_CLIENTS + 1`**. |
+| **`CLIENT_IDS`** | e.g. **`[1..8]`** — parties that run local weight / GSAM / across-eval. |
 
-**Consistency:** **`len(DATASET_LIST) == N_CLIENTS`**. If you add a ninth client folder, add its name to **`DATASET_LIST`** and set **`N_CLIENTS = 9`**.
+**Consistency:** **`len(DATASET_LIST) == N_CLIENTS`**. Checkpoints: **`N_PARTIES`** files (`*_0.ckpt` = teacher, `*_1.ckpt`… = clients).
 
 ---
 
@@ -191,12 +267,12 @@ Set **`DATASET_TYPE = 'cifar10'`**.
 
 1. **`N_CLIENTS`** ≠ **`len(DATASET_LIST)`** (GenImage) → wrong client folders or index errors.  
 2. **`OUTPUT_CHANNEL`** ≠ number of classes → shape mismatch in the classifier or loss.  
-3. **`PRIVATE_NETS_NAME_LIST`** shorter/longer than **`N_CLIENTS`** → `init_nets` or checkpoint index mismatch.  
+3. **`PROTOCOL`** changed after pretrain (or mismatched Homo vs Hete) → wrong checkpoint filenames (`EfficientNetB0_i` vs `ResNet10_i`, …).  
 4. **`main.py`** without pretrain → missing **`Model_Storage/...`** files.  
 5. **`NOISE_TYPE`** / **`NOISE_RATE`** changed after pretrain → checkpoint path no longer matches.  
 6. Data not under `<repo>/data/...` → update the **`os.path.join(_SMARTFED_ROOT, ...)`** lines in the active **`DATASET_TYPE`** branch.
 
-After any change, re-run **`pretrain.py`** if you depend on freshly written checkpoints, then **`main.py`** or **`train_fedavg.py`**.
+After any change to **`PROTOCOL`** or backbones, re-run **`pretrain.py`**, then **`main.py`** or **`train_fedavg.py`**.
 
 ---
 
@@ -206,12 +282,13 @@ Training expects **fixed subdirectory names** unless you change `Dataset/init_da
 
 ### GenImage (`DATASET_TYPE = 'genimage'`)
 
-Each client is **`PRIVATE_DATASET_DIR / <name>`** where `<name>` matches `Config.DATASET_LIST` (e.g. `adm`, `BigGAN`, `glide`, `midjourney`, `sdv4`, `sdv5`, `vqdm`, `wukong`).
+**Server teacher (party 0):** `PUBLIC_DATASET_DIR` (e.g. `.../genimage_pub`).  
+**Clients (parties 1..N):** `PRIVATE_DATASET_DIR / <name>` via `Config.party_datadir(party_id)`.
 
-Under each client root:
+Under each root:
 
 ```text
-<client_root>/
+<root>/
 ├── train/
 │   ├── nature/     # real → label 0
 │   └── ai/         # fake → label 1
@@ -220,9 +297,15 @@ Under each client root:
     └── ai/
 ```
 
-**Public** data (`PUBLIC_DATASET_DIR`) uses the same layout under one folder (e.g. `.../genimage_pub`).
+**Known data bug (fixed by script):** `wukong/val/ai` was a byte-identical copy of `vqdm/val/ai` (`VQDM_*` files) while `wukong/train/ai` was correct. That made wukong own-val ≈50% and forced `vqdm ≡ wukong` metrics. Repair with:
 
-Runtime path: `os.path.join(PRIVATE_DATASET_DIR, DATASET_LIST[client_index])`.
+```bash
+python scripts/fix_wukong_val.py          # rebuild val/ai from wukong train holdout
+# then re-pretrain party 8 only (Config.PRETRAIN_PARTY_IDS = [8])
+python pretrain.py
+```
+
+`main.py` / `pretrain.py` call `Dataset.integrity.check_genimage_client_val` and will **abort** if the bad VQDM-in-wukong-val pattern reappears.
 
 ### CIFAR-10 (`DATASET_TYPE = 'cifar10'`)
 
@@ -480,13 +563,243 @@ print(len(ds), ds.class_names)
 
 ---
 
+## CIFAR-10: client selection and loss weighting
+
+Three agent settings, from no learned agents to a fixed rule to an LLM, plus a log of LLM calls, latency, and fallbacks.
+
+Run all commands from the repo root.
+
+### Modes (`config_cifar.py` / env)
+
+Use **`SMARTFED_CONFIG=cifar`** (or `SMARTFED_DATASET_TYPE=cifar10`) so `config.py` loads `config_cifar.py` instead of GenImage.
+
+| Mode | Env | DCSA | AFWA |
+|------|-----|------|------|
+| No agents | `SMARTFED_AGENT_MODE=wo_ma` | all clients (budget=16) | fixed coef `0.1` |
+| Rule-based | `SMARTFED_AGENT_MODE=rule_based` | `adaptive` (no LLM), all clients | rule-based coefficients (`use_llm=False`) |
+| LLM | `SMARTFED_AGENT_MODE=llm` | Ollama Llama3, all clients | Ollama Llama3, \(\alpha\in[0.05,0.3]\) |
+
+To change selection and weighting separately, set `SMARTFED_AGENT_MODE=custom` and override `SMARTFED_DCSA_MODE` / `SMARTFED_AFWA_MODE` ∈ `{off, rule_based, llm}`.
+
+CIFAR-10 defaults in `config_cifar.py`: **16 clients**, `Homo_FL`, `GSAM_TOTAL_EPOCHS=5`, KL **head-only** / 20 batches / \(T=2\), KL teacher = `public_model.ckpt`, selection budget **16** (the selection sweep below uses **4**), checkpoints under `Model_Storage_cifar10/`.
+
+Official pickles (optional convert): `data/cifar-10-python`
+
+Cost instrumentation (`llm_client_selection.GLOBAL_LLM_COST`): latency per call, calls/round, tokens when Ollama returns them, fallback rate (timeout / API / empty / parse / selector). Logged as `phase=llm_cost` in the metrics CSV and `LLM cost cumulative` at end of `main.py`.
+
+### Suggested order
+
+1. (Optional) Convert CIFAR pickles → images  
+2. Pretrain seeds `0,1,2`  
+3. Agent modes: `wo_ma` / `rule_based` / `llm` × 3 seeds  
+4. Selection sweep: vary DCSA, AFWA stays on the LLM × 3 seeds  
+5. Weighting sweep: vary AFWA, DCSA stays on the LLM × 3 seeds  
+6. Summarize logs  
+
+For LLM modes: `ollama serve` and `ollama pull llama3:8b`.
+
+### Batch runner (optional)
+
+```bash
+# All three agent modes, seeds 0, 1, and 2
+python scripts/run_r3_major4_cifar.py --seeds 0,1,2 --figure both
+
+# Selection sweep only (AFWA stays on the LLM) / weighting sweep only (DCSA stays on the LLM)
+python scripts/run_r3_major4_cifar.py --seeds 0,1,2 --figure 4
+python scripts/run_r3_major4_cifar.py --seeds 0,1,2 --figure 5
+
+# LLM mode only: 8 clients, public set 6,000 train / 1,040 test
+# (the remaining images are split equally; logs go under Logs/r3_major4/<stamp>)
+python scripts/run_r3_major4_cifar.py --seeds 0,1,2 --figure llm \
+  --n-clients 8 --public-train 6000 --public-test 1040
+
+# Mean accuracy plus LLM call count, latency, and fallback rate
+python scripts/summarize_r3_major4.py --log-dir Logs/r3_major4/<stamp>
+```
+
+### 0) Convert pickle → images (skip if `data/cifar` already exists)
+
+```bash
+python scripts/convert_cifar10.py \
+  --pickle-root data/cifar-10-python \
+  --output-dir data/cifar
+```
+
+### 1) Pretrain (one run per seed; shared by all modes)
+
+**Seed 0**
+
+```bash
+SMARTFED_CONFIG=cifar \
+SMARTFED_N_CLIENTS=16 \
+SMARTFED_PROTOCOL=Homo_FL \
+SMARTFED_SEED=0 \
+SMARTFED_PRIVATE_DATASET_DIR=data/cifar \
+SMARTFED_PUBLIC_DATASET_DIR=data/cifar \
+python pretrain.py
+```
+
+**Seed 1** — same command with `SMARTFED_SEED=1`  
+**Seed 2** — same command with `SMARTFED_SEED=2`
+
+### 2) Agent modes: none, rule-based, LLM
+
+Repeat each block below with `SMARTFED_SEED=0`, then `1`, then `2`.
+
+#### 2.1 No agents
+
+```bash
+SMARTFED_CONFIG=cifar \
+SMARTFED_N_CLIENTS=16 \
+SMARTFED_PROTOCOL=Homo_FL \
+SMARTFED_SEED=0 \
+SMARTFED_AGENT_MODE=wo_ma \
+SMARTFED_SELECTION_BUDGET=16 \
+SMARTFED_COMMUNICATION_EPOCH=40 \
+SMARTFED_LOG_LLM_COST=1 \
+SMARTFED_PRIVATE_DATASET_DIR=data/cifar \
+SMARTFED_PUBLIC_DATASET_DIR=data/cifar \
+python main.py
+```
+
+#### 2.2 Rule-based — no LLM calls
+
+```bash
+SMARTFED_CONFIG=cifar \
+SMARTFED_N_CLIENTS=16 \
+SMARTFED_PROTOCOL=Homo_FL \
+SMARTFED_SEED=0 \
+SMARTFED_AGENT_MODE=rule_based \
+SMARTFED_SELECTION_BUDGET=16 \
+SMARTFED_COMMUNICATION_EPOCH=40 \
+SMARTFED_LOG_LLM_COST=1 \
+SMARTFED_PRIVATE_DATASET_DIR=data/cifar \
+SMARTFED_PUBLIC_DATASET_DIR=data/cifar \
+python main.py
+```
+
+#### 2.3 LLM-driven (Llama3:8b)
+
+```bash
+SMARTFED_CONFIG=cifar \
+SMARTFED_N_CLIENTS=16 \
+SMARTFED_PROTOCOL=Homo_FL \
+SMARTFED_SEED=0 \
+SMARTFED_AGENT_MODE=llm \
+SMARTFED_OLLAMA_MODEL=llama3:8b \
+SMARTFED_SELECTION_BUDGET=16 \
+SMARTFED_COMMUNICATION_EPOCH=40 \
+SMARTFED_LOG_LLM_COST=1 \
+SMARTFED_PRIVATE_DATASET_DIR=data/cifar \
+SMARTFED_PUBLIC_DATASET_DIR=data/cifar \
+python main.py
+```
+
+### 3) Selection sweep (weighting stays on the LLM)
+
+Use **budget 4** so selection has an effect. With selection off, 4 clients are sampled at random.
+
+#### 3.1 DCSA off
+
+```bash
+SMARTFED_CONFIG=cifar SMARTFED_N_CLIENTS=16 SMARTFED_PROTOCOL=Homo_FL \
+SMARTFED_SEED=0 SMARTFED_AGENT_MODE=custom \
+SMARTFED_DCSA_MODE=off SMARTFED_AFWA_MODE=llm \
+SMARTFED_OLLAMA_MODEL=llama3:8b SMARTFED_SELECTION_BUDGET=4 \
+SMARTFED_COMMUNICATION_EPOCH=40 SMARTFED_LOG_LLM_COST=1 \
+SMARTFED_PRIVATE_DATASET_DIR=data/cifar \
+SMARTFED_PUBLIC_DATASET_DIR=data/cifar \
+python main.py
+```
+
+#### 3.2 DCSA rule-based (no LLM)
+
+```bash
+SMARTFED_CONFIG=cifar SMARTFED_N_CLIENTS=16 SMARTFED_PROTOCOL=Homo_FL \
+SMARTFED_SEED=0 SMARTFED_AGENT_MODE=custom \
+SMARTFED_DCSA_MODE=rule_based SMARTFED_DCSA_RULE_STRATEGY=adaptive \
+SMARTFED_AFWA_MODE=llm \
+SMARTFED_OLLAMA_MODEL=llama3:8b SMARTFED_SELECTION_BUDGET=4 \
+SMARTFED_COMMUNICATION_EPOCH=40 SMARTFED_LOG_LLM_COST=1 \
+SMARTFED_PRIVATE_DATASET_DIR=data/cifar \
+SMARTFED_PUBLIC_DATASET_DIR=data/cifar \
+python main.py
+```
+
+#### 3.3 DCSA LLM
+
+```bash
+SMARTFED_CONFIG=cifar SMARTFED_N_CLIENTS=16 SMARTFED_PROTOCOL=Homo_FL \
+SMARTFED_SEED=0 SMARTFED_AGENT_MODE=custom \
+SMARTFED_DCSA_MODE=llm SMARTFED_AFWA_MODE=llm \
+SMARTFED_OLLAMA_MODEL=llama3:8b SMARTFED_SELECTION_BUDGET=4 \
+SMARTFED_COMMUNICATION_EPOCH=40 SMARTFED_LOG_LLM_COST=1 \
+SMARTFED_PRIVATE_DATASET_DIR=data/cifar \
+SMARTFED_PUBLIC_DATASET_DIR=data/cifar \
+python main.py
+```
+
+### 4) Weighting sweep (selection stays on the LLM)
+
+#### 4.1 AFWA off (fixed coefficient 0.1)
+
+```bash
+SMARTFED_CONFIG=cifar SMARTFED_N_CLIENTS=16 SMARTFED_PROTOCOL=Homo_FL \
+SMARTFED_SEED=0 SMARTFED_AGENT_MODE=custom \
+SMARTFED_DCSA_MODE=llm SMARTFED_AFWA_MODE=off \
+SMARTFED_AFWA_FIXED_COEFFICIENT=0.1 \
+SMARTFED_OLLAMA_MODEL=llama3:8b SMARTFED_SELECTION_BUDGET=16 \
+SMARTFED_COMMUNICATION_EPOCH=40 SMARTFED_LOG_LLM_COST=1 \
+SMARTFED_PRIVATE_DATASET_DIR=data/cifar \
+SMARTFED_PUBLIC_DATASET_DIR=data/cifar \
+python main.py
+```
+
+#### 4.2 AFWA rule-based
+
+```bash
+SMARTFED_CONFIG=cifar SMARTFED_N_CLIENTS=16 SMARTFED_PROTOCOL=Homo_FL \
+SMARTFED_SEED=0 SMARTFED_AGENT_MODE=custom \
+SMARTFED_DCSA_MODE=llm SMARTFED_AFWA_MODE=rule_based \
+SMARTFED_OLLAMA_MODEL=llama3:8b SMARTFED_SELECTION_BUDGET=16 \
+SMARTFED_COMMUNICATION_EPOCH=40 SMARTFED_LOG_LLM_COST=1 \
+SMARTFED_PRIVATE_DATASET_DIR=data/cifar \
+SMARTFED_PUBLIC_DATASET_DIR=data/cifar \
+python main.py
+```
+
+#### 4.3 AFWA LLM
+
+```bash
+SMARTFED_CONFIG=cifar SMARTFED_N_CLIENTS=16 SMARTFED_PROTOCOL=Homo_FL \
+SMARTFED_SEED=0 SMARTFED_AGENT_MODE=custom \
+SMARTFED_DCSA_MODE=llm SMARTFED_AFWA_MODE=llm \
+SMARTFED_OLLAMA_MODEL=llama3:8b SMARTFED_SELECTION_BUDGET=16 \
+SMARTFED_COMMUNICATION_EPOCH=40 SMARTFED_LOG_LLM_COST=1 \
+SMARTFED_PRIVATE_DATASET_DIR=data/cifar \
+SMARTFED_PUBLIC_DATASET_DIR=data/cifar \
+python main.py
+```
+
+### 5) Summarize results
+
+```bash
+# After the batch runner:
+python scripts/summarize_r3_major4.py --log-dir Logs/r3_major4/<stamp>
+
+# After manual runs: read accuracy / "LLM cost cumulative" in Logs/main_*.log
+# and phase=llm_cost rows in Logs/main_metrics_*.csv
+```
+
+---
+
 ## General troubleshooting
 
 | Issue | What to check |
 |-------|----------------|
 | Dataset not found | Paths in `config.py`; GenImage subfolder names vs `DATASET_LIST`. |
 | Wrong GenImage layout | Must have `train/nature`, `train/ai`, `val/nature`, `val/ai`. |
-| Empty CIFAR tree | Run `Dataset/cifar10_to_images.py` from `Dataset/`; confirm `data/cifar/`. |
+| Empty CIFAR tree | Run `scripts/convert_cifar10.py` (or `Dataset/cifar10_to_images.py`); confirm `data/cifar/`. |
 | CUDA OOM | Reduce batch sizes in `config.py`. |
 | Ollama / LLM errors | `ollama serve`, `ollama pull`, firewall on `11434`; agents fall back to non-LLM logic when possible. |
 | Import errors | Run from repo root; `Dataset` package and `sys.path` usage in scripts. |
@@ -498,14 +811,22 @@ print(len(ds), ds.class_names)
 | File | Purpose |
 |------|---------|
 | `main.py` | Hybrid FL, `weight_quality`, LLM selection, loss weighting. |
-| `config.py` | Dataset type, paths, nets, hyperparameters. |
+| `config.py` | Dispatcher: GenImage by default, CIFAR when `SMARTFED_CONFIG=cifar`. |
+| `config_cifar.py` | CIFAR-10 hyperparameters (16 clients, GSAM=5, KL head-only, AFWA clip). |
+| `config_genimage.py` | GenImage / DiffusionFace hyperparameters. |
 | `pretrain.py` | Pretraining entry point. |
 | `train_fedavg.py` | Standalone FedAvg. |
 | `Dataset/init_dataset.py` | `genimage`, `celebdf2` datasets. |
-| `Dataset/utils.py` | Dataloaders, **`init_nets`** (EfficientNet-B0 default), logging helpers. |
+| `Dataset/utils.py` | Dataloaders, **`init_nets`** (Homo/Hete backbones), logging helpers. |
 | `loss.py` | CE, SCE, etc. |
-| `llm_client_selection.py` | Selection strategies and Ollama client. |
-| `loss_weighting_agent.py` | Dynamic loss coefficients. |
+| `llm_client_selection.py` | Selection strategies, Ollama client, **`LLMCostTracker`**. |
+| `loss_weighting_agent.py` | Dynamic loss coefficients (LLM or a fixed rule). |
+| `scripts/run_r3_major4_cifar.py` | Multi-seed CIFAR runner for the agent modes above. |
+| `scripts/summarize_r3_major4.py` | Aggregate accuracy and LLM cost from those logs. |
+| `scripts/run_r2_table7_genimage.py` | GenImage comparison of uniform, dataset-size, and signed-loss \(w_k\) (20 rounds each). |
+| `scripts/convert_cifar10.py` | Pickle → `data/cifar` images. |
+
+Checkpoints (`*.ckpt`), `Logs/`, `Model_Storage*/`, and `data/` are gitignored. A fresh clone has source only.
 
 ---
 

@@ -91,7 +91,8 @@ class ResNet(nn.Module):
             self.layer2,
             self.layer3,
             self.layer4,
-            nn.AvgPool2d(kernel_size=4)
+            # Adaptive pool: works for CIFAR (32) and GenImage (224).
+            nn.AdaptiveAvgPool2d((1, 1)),
         )
 
         # projector 2 layer

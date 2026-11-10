@@ -15,12 +15,17 @@ from torch.nn import Module
 sys.path.append("..")
 sys.path.append('./')
 
-from Dataset.utils import init_logs, get_dataloader, init_nets, mkdirs
+from Dataset.utils import (
+    init_logs, get_dataloader, init_nets, mkdirs, compute_accuracy_and_auc,
+    MetricsLogger, log_run_config, split_cifar10_indices,
+)
+from Dataset.integrity import check_genimage_client_val
 from Dataset.init_dataset import genimage
 from Dataset.cifar10_dataset import CIFAR10Dataset, get_cifar10_transforms
 from Network.Models_Def.resnet import ResNet10, ResNet12
 from loss import SCELoss
 from config import Config
+from parallel_utils import iter_chunks, map_parallel
 
 
 def get_cifar10_dataloader(datadir, train_bs, test_bs, dataidxs=None, train_flag=True):
@@ -76,11 +81,17 @@ def setup_device(seed: int) -> torch.device:
     
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    if getattr(Config, 'REQUIRE_CUDA', True) and not torch.cuda.is_available():
+        raise RuntimeError(
+            'CUDA is required for training (Config.REQUIRE_CUDA=True) but no GPU was found.'
+        )
+    # Pretrain does not need Ollama; keep GPU free for the nets.
+    os.environ.setdefault('OLLAMA_NUM_GPU', '0')
     device_ids = [0]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    use_bench = bool(getattr(Config, 'CUDNN_BENCHMARK', True)) and device.type == 'cuda'
+    torch.backends.cudnn.benchmark = use_bench
+    torch.backends.cudnn.deterministic = not use_bench
     
     return device, device_ids
 
@@ -94,7 +105,9 @@ def pretrain_network(
     learning_rate: float,
     num_classes: int,
     device: torch.device,
-    logger: Any
+    logger: Any,
+    metrics_logger: Optional[MetricsLogger] = None,
+    client_id: Optional[int] = None,
 ) -> Module:
     """Pretrain a neural network.
     
@@ -109,9 +122,11 @@ def pretrain_network(
         num_classes: Number of output classes
         device: Device to use for training
         logger: Logger for logging training progress
+        metrics_logger: Optional CSV metrics writer
+        client_id: Client index for metrics rows
         
     Returns:
-        Module: Trained neural network
+        Module: Network restored to the best eval checkpoint (Acc, then AUC).
     """
     # Setup loss function
     if loss_function == 'CE':
@@ -125,11 +140,18 @@ def pretrain_network(
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     elif optimizer_name == 'SGD':
         optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-4)
+
+    best_acc = -1.0
+    best_auc = float('nan')
+    best_epoch = -1
+    best_state = None
     
     # Training loop
-    model.train()
     for _epoch in range(epoch):
+        model.train()  # must re-enable train mode after each eval
         log_interval = 100
+        running_loss = 0.0
+        num_batches = 0
         
         for batch_idx, (images, labels) in enumerate(train_dataloader):
             images, labels = images.to(device), labels.to(device)
@@ -142,6 +164,9 @@ def pretrain_network(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            running_loss += loss.item()
+            num_batches += 1
             
             # Logging
             if batch_idx % log_interval == 0:
@@ -149,20 +174,60 @@ def pretrain_network(
                     f'Train Epoch: {_epoch} [{batch_idx * len(images)}/{len(train_dataloader.dataset)} '
                     f'({100. * batch_idx / len(train_dataloader):.0f}%)]\tLoss: {loss.item():.6f}'
                 )
+                if metrics_logger is not None:
+                    metrics_logger.log(
+                        phase='pretrain_batch',
+                        client_id=client_id,
+                        epoch=_epoch,
+                        loss=loss.item(),
+                        extra=f'batch={batch_idx}',
+                    )
         
         # Evaluation
-        model.eval()
-        with torch.no_grad():
-            correct = 0
-            total = 0
-            for inputs, labels in eval_dataloader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                _, predicted = torch.max(outputs.data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-            
-            logger.info(f'Evaluate Accuracy: {100 * correct / total:.2f}%')
+        accuracy, auc = compute_accuracy_and_auc(model, eval_dataloader, device)
+        avg_loss = running_loss / max(num_batches, 1)
+        logger.info(
+            f'Evaluate Accuracy: {accuracy:.2f}%, AUC: {auc:.4f}, '
+            f'AvgTrainLoss: {avg_loss:.6f}'
+        )
+        if metrics_logger is not None:
+            metrics_logger.log(
+                phase='pretrain_epoch',
+                client_id=client_id,
+                epoch=_epoch,
+                loss=avg_loss,
+                accuracy=accuracy,
+                auc=auc,
+            )
+
+        auc_cmp = auc if auc == auc else -1.0  # NaN → lose ties
+        best_auc_cmp = best_auc if best_auc == best_auc else -1.0
+        if accuracy > best_acc or (accuracy == best_acc and auc_cmp > best_auc_cmp):
+            best_acc = accuracy
+            best_auc = auc
+            best_epoch = _epoch
+            best_state = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
+            logger.info(
+                f'New best checkpoint at epoch {_epoch}: '
+                f'Acc={best_acc:.2f}%, AUC={best_auc:.4f}'
+            )
+            if metrics_logger is not None:
+                metrics_logger.log(
+                    phase='pretrain_best',
+                    client_id=client_id,
+                    epoch=_epoch,
+                    accuracy=best_acc,
+                    auc=best_auc,
+                )
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        logger.info(
+            f'Restored best model (epoch {best_epoch}): '
+            f'Acc={best_acc:.2f}%, AUC={best_auc:.4f}'
+        )
     
     return model
 
@@ -171,8 +236,8 @@ def evaluate_network(
     dataloader: DataLoader,
     device: torch.device,
     logger: Any
-) -> float:
-    """Evaluate a neural network.
+):
+    """Evaluate a neural network (Accuracy + AUC).
     
     Args:
         model: Neural network model
@@ -181,96 +246,67 @@ def evaluate_network(
         logger: Logger for logging evaluation results
         
     Returns:
-        float: Accuracy percentage
+        Tuple[float, float]: Accuracy percentage and AUC
     """
-    model.eval()
-    with torch.no_grad():
-        correct = 0
-        total = 0
-        for images, labels in dataloader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-        
-        accuracy = 100 * correct / total
-        logger.info(f'Test Accuracy: {accuracy:.2f}%')
-        return accuracy
+    accuracy, auc = compute_accuracy_and_auc(model, dataloader, device)
+    logger.info(f'Test Accuracy: {accuracy:.2f}%, AUC: {auc:.4f}')
+    return accuracy, auc
 
 def main():
     """Main training function."""
     # Setup logging and device
-    mkdirs(f'./Model_Storage/{Config.PARTICIPANT_PARAMS["loss_function"]}/{Config.NOISE_TYPE}{Config.NOISE_RATE}')
+    mkdirs(f'{getattr(Config, "MODEL_STORAGE_ROOT", "./Model_Storage")}/{Config.PARTICIPANT_PARAMS["loss_function"]}/{Config.NOISE_TYPE}{Config.NOISE_RATE}')
     logger = init_logs()
+    metrics_logger = MetricsLogger(run_id=getattr(logger, 'run_id', None))
+    logger.info(f'Metrics CSV: {metrics_logger.path}')
+    log_run_config(logger, Config)
     device, device_ids = setup_device(Config.SEED)
     
     logger.info(f"Loading Participants' Data and Model for {Config.DATASET_TYPE}")
     
-    # Initialize networks
+    n_parties = int(getattr(Config, 'N_PARTIES', Config.N_CLIENTS))
+    all_party_ids = list(range(n_parties))
+    client_ids = list(getattr(Config, 'CLIENT_IDS', list(range(Config.N_CLIENTS))))
+    pretrain_only = getattr(Config, 'PRETRAIN_PARTY_IDS', None)
+    if pretrain_only:
+        party_ids = [int(p) for p in pretrain_only]
+        bad = [p for p in party_ids if p not in all_party_ids]
+        if bad:
+            raise ValueError(f'PRETRAIN_PARTY_IDS out of range: {bad}; valid={all_party_ids}')
+    else:
+        party_ids = list(all_party_ids)
+    logger.info(
+        f'Parties={n_parties}, HAS_SERVER_TEACHER={getattr(Config, "HAS_SERVER_TEACHER", False)}, '
+        f'CLIENT_IDS={client_ids}, PRETRAIN_PARTY_IDS={party_ids}'
+    )
+
+    # Initialize networks (includes server teacher as party 0 when enabled)
     if Config.INTRA_DATASET:
         net_dataidx_map = {}
-        for index in range(Config.N_CLIENTS):
+        for index in client_ids:
             idxes = np.random.permutation(50000)
             idxes = idxes[0:Config.PRIVATE_DATA_LEN]
             net_dataidx_map[index] = idxes
         logger.info(net_dataidx_map)
         net_list = init_nets(
-            n_parties=Config.N_CLIENTS,
+            n_parties=n_parties,
             nets_name_list=Config.NETS_NAME_LIST,
             num_classes=Config.OUTPUT_CHANNEL
         )
     else:
         if Config.DATASET_TYPE == 'cifar10':
-            # For CIFAR-10, create different data splits for each client and public data
-            net_dataidx_map = {}
-            test_dataidx_map = {}
-            public_train_dataidx = None
-            public_test_dataidx = None
-            
-            # Training data distribution (50,000 samples)
-            total_train_samples = 50000
-            # Reserve some samples for public training (e.g., 10% = 5,000 samples)
-            public_train_samples = int(total_train_samples * 0.1)  # 5,000 samples
-            local_train_samples = total_train_samples - public_train_samples  # 45,000 samples
-            train_samples_per_client = local_train_samples // Config.N_CLIENTS
-            
-            # Test data distribution (10,000 samples)
-            total_test_samples = 10000
-            # Reserve some samples for public testing (e.g., 10% = 1,000 samples)
-            public_test_samples = int(total_test_samples * 0.1)  # 1,000 samples
-            local_test_samples = total_test_samples - public_test_samples  # 9,000 samples
-            test_samples_per_client = local_test_samples // Config.N_CLIENTS
-            
-            # Randomize training and test indices before splitting
-            np.random.seed(Config.SEED)  # Ensure reproducibility
-            train_indices = np.random.permutation(total_train_samples)
-            test_indices = np.random.permutation(total_test_samples)
-            
-            # Split public data first
-            public_train_dataidx = train_indices[:public_train_samples]
-            local_train_indices = train_indices[public_train_samples:]
-            
-            public_test_dataidx = test_indices[:public_test_samples]
-            local_test_indices = test_indices[public_test_samples:]
-            
-            for index in range(Config.N_CLIENTS):
-                # Training data split (randomized, excluding public data)
-                train_start_idx = index * train_samples_per_client
-                train_end_idx = train_start_idx + train_samples_per_client
-                if index == Config.N_CLIENTS - 1:  # Last client gets remaining samples
-                    train_end_idx = local_train_samples
-                train_idxes = local_train_indices[train_start_idx:train_end_idx]
-                net_dataidx_map[index] = train_idxes
-                
-                # Test data split (randomized, excluding public data)
-                test_start_idx = index * test_samples_per_client
-                test_end_idx = test_start_idx + test_samples_per_client
-                if index == Config.N_CLIENTS - 1:  # Last client gets remaining samples
-                    test_end_idx = local_test_samples
-                test_idxes = local_test_indices[test_start_idx:test_end_idx]
-                test_dataidx_map[index] = test_idxes
-            
+            (
+                public_train_dataidx,
+                public_test_dataidx,
+                net_dataidx_map,
+                test_dataidx_map,
+            ) = split_cifar10_indices(
+                n_clients=Config.N_CLIENTS,
+                seed=Config.SEED,
+                public_train=int(getattr(Config, 'CIFAR_PUBLIC_TRAIN', 5000)),
+                public_test=int(getattr(Config, 'CIFAR_PUBLIC_TEST', 1000)),
+                client_ids=client_ids,
+            )
             logger.info(f"CIFAR-10 data split:")
             logger.info(f"  - Public train: {len(public_train_dataidx)} samples")
             logger.info(f"  - Public test: {len(public_test_dataidx)} samples")
@@ -278,11 +314,11 @@ def main():
             logger.info(f"  - Local test: {[(k, len(v)) for k, v in test_dataidx_map.items()]}")
             logger.info(f"Random seed used: {Config.SEED}")
         else:
-            net_dataidx_map = {index: None for index in range(Config.N_CLIENTS)}
+            net_dataidx_map = {index: None for index in all_party_ids}
             logger.info(net_dataidx_map)
         
         net_list = init_nets(
-            n_parties=Config.N_CLIENTS,
+            n_parties=n_parties,
             nets_name_list=Config.NETS_NAME_LIST,
             num_classes=Config.OUTPUT_CHANNEL
         )
@@ -317,7 +353,7 @@ def main():
         
         # Train public model
         public_model = pretrain_network(
-            epoch=20,  # Same as private models
+            epoch=Config.PRETRAIN_EPOCH,
             model=public_model,
             train_dataloader=public_train_dl,
             eval_dataloader=public_test_dl,
@@ -326,15 +362,22 @@ def main():
             learning_rate=Config.PARTICIPANT_PARAMS['learning_rate'],
             num_classes=Config.OUTPUT_CHANNEL,
             device=device,
-            logger=logger
+            logger=logger,
+            metrics_logger=metrics_logger,
+            client_id=-1,
         )
         
-        # Evaluate and save public model
-        eval_acc = evaluate_network(public_model, public_test_dl, device, logger)
-        logger.info(f'Public model evaluation accuracy: {eval_acc:.2f}%')
+        # Evaluate and save public model (best checkpoint restored above)
+        eval_acc, eval_auc = evaluate_network(public_model, public_test_dl, device, logger)
+        logger.info(
+            f'Public model (best) evaluation accuracy: {eval_acc:.2f}%, AUC: {eval_auc:.4f}'
+        )
+        metrics_logger.log(
+            phase='public_final_eval', client_id=-1, accuracy=eval_acc, auc=eval_auc
+        )
         
         public_save_path = (
-            f'./Model_Storage/{Config.PARTICIPANT_PARAMS["loss_function"]}/'
+            f'{getattr(Config, "MODEL_STORAGE_ROOT", "./Model_Storage")}/{Config.PARTICIPANT_PARAMS["loss_function"]}/'
             f'{Config.NOISE_TYPE}{Config.NOISE_RATE}/public_model.ckpt'
         )
         torch.save(public_model.state_dict(), public_save_path)
@@ -343,11 +386,20 @@ def main():
         # Clear public model from GPU
         clear_gpu(public_model)
     
-    logger.info('Pretraining Participants Models')
-    for index in range(Config.N_CLIENTS):
-        # Setup data loaders based on dataset type
-        if Config.DATASET_TYPE == 'genimage':
-            root_full = os.path.join(Config.PRIVATE_DATASET_DIR, Config.DATASET_LIST[index])
+    logger.info(
+        f'Pretraining Participants Models '
+        f'(parallel_clients={Config.PARALLEL_CLIENTS}, parties={party_ids})'
+    )
+
+    def pretrain_one_party(index: int):
+        """Train/eval/save one party (server teacher or client)."""
+        role = 'server_teacher' if Config.is_server_teacher(index) else 'client'
+        ds_key = Config.party_dataset_key(index)
+
+        if Config.DATASET_TYPE in ('genimage', 'diffusionface'):
+            root_full = Config.party_datadir(index)
+            if not Config.is_server_teacher(index):
+                check_genimage_client_val(root_full, logger=logger)
             train_dl_local, train_ds_local = get_dataloader(
                 dataset=Config.PRIVATE_DATASET_NAME,
                 datadir=root_full,
@@ -358,7 +410,6 @@ def main():
                 noise_rate=Config.NOISE_RATE,
                 train_flag=True
             )
-            
             test_dl, test_ds = get_dataloader(
                 dataset=Config.PRIVATE_DATASET_NAME,
                 datadir=root_full,
@@ -370,7 +421,6 @@ def main():
                 train_flag=False
             )
         elif Config.DATASET_TYPE == 'cifar10':
-            # For CIFAR-10, use data selection for different clients
             private_dataidx = net_dataidx_map[index]
             train_dl_local, train_ds_local = get_cifar10_dataloader(
                 datadir=Config.PRIVATE_DATASET_DIR,
@@ -379,8 +429,6 @@ def main():
                 dataidxs=private_dataidx,
                 train_flag=True
             )
-            
-            # Test dataset uses distributed test data for each client
             test_dataidx = test_dataidx_map[index] if test_dataidx_map is not None else None
             test_dl, test_ds = get_cifar10_dataloader(
                 datadir=Config.PRIVATE_DATASET_DIR,
@@ -390,7 +438,6 @@ def main():
                 train_flag=False
             )
         else:
-            # Fallback to original method
             train_dl_local, train_ds_local = get_dataloader(
                 dataset=Config.PRIVATE_DATASET_NAME,
                 datadir=Config.PRIVATE_DATASET_DIR,
@@ -401,7 +448,6 @@ def main():
                 noise_rate=Config.NOISE_RATE,
                 train_flag=True
             )
-            
             test_dl, test_ds = get_dataloader(
                 dataset=Config.PRIVATE_DATASET_NAME,
                 datadir=Config.PRIVATE_DATASET_DIR,
@@ -412,18 +458,18 @@ def main():
                 noise_rate=Config.NOISE_RATE,
                 train_flag=False
             )
-        
-        logger.info(f'Dataset: {Config.DATASET_TYPE}, Client {index}, '
-                   f'Training samples: {len(train_ds_local)}, Test samples: {len(test_ds)}')
-        
-        # Train model
-        network = net_list[index]
-        network = nn.DataParallel(network, device_ids=device_ids).to(device)
+
+        logger.info(
+            f'Dataset: {Config.DATASET_TYPE}, party {index} ({role}, {ds_key}), '
+            f'Training samples: {len(train_ds_local)}, Test samples: {len(test_ds)}'
+        )
+
+        # Avoid DataParallel when multiple clients share one GPU via threads.
+        network = net_list[index].to(device)
         netname = Config.PRIVATE_NETS_NAME_LIST[index]
-        
-        logger.info(f'Pretraining model {index} with {len(train_ds_local)} training samples')
+        logger.info(f'Pretraining model {index} ({role}/{ds_key}) with {len(train_ds_local)} samples')
         network = pretrain_network(
-            epoch=20,  # Fixed pretrain epochs
+            epoch=Config.PRETRAIN_EPOCH,
             model=network,
             train_dataloader=train_dl_local,
             eval_dataloader=test_dl,
@@ -432,26 +478,46 @@ def main():
             learning_rate=Config.PARTICIPANT_PARAMS['learning_rate'],
             num_classes=Config.OUTPUT_CHANNEL,
             device=device,
-            logger=logger
+            logger=logger,
+            metrics_logger=metrics_logger,
+            client_id=index,
         )
-        
-        # Evaluate and save model
-        eval_acc = evaluate_network(network, test_dl, device, logger)
-        logger.info(f'Training Evaluation accuracy on model {index}: {eval_acc:.2f}%')
-        
+
+        eval_acc, eval_auc = evaluate_network(network, test_dl, device, logger)
+        logger.info(
+            f'Training Evaluation accuracy on model {index} ({role}, best): '
+            f'{eval_acc:.2f}%, AUC: {eval_auc:.4f}'
+        )
+        metrics_logger.log(
+            phase='server_teacher_final_eval' if role == 'server_teacher' else 'client_final_eval',
+            client_id=index,
+            accuracy=eval_acc,
+            auc=eval_auc,
+        )
+
         save_path = (
-            f'./Model_Storage/{Config.PARTICIPANT_PARAMS["loss_function"]}/'
+            f'{getattr(Config, "MODEL_STORAGE_ROOT", "./Model_Storage")}/{Config.PARTICIPANT_PARAMS["loss_function"]}/'
             f'{Config.NOISE_TYPE}{Config.NOISE_RATE}/{netname}_{index}.ckpt'
         )
+        # Save plain state_dict (no DataParallel wrapper).
         torch.save(network.state_dict(), save_path)
-        logger.info(f'Saved model {index} to {save_path}')
-    
+        logger.info(f'Saved model {index} ({role}/{ds_key}) to {save_path}')
+        network = network.cpu()
+        net_list[index] = network
+        torch.cuda.empty_cache()
+        return index
+
+    for chunk in iter_chunks(party_ids, Config.PARALLEL_CLIENTS):
+        logger.info(f'Pretraining party chunk: {list(chunk)}')
+        map_parallel(pretrain_one_party, chunk, max_workers=len(chunk))
+        torch.cuda.empty_cache()
+
     # Final evaluation
-    logger.info('Evaluating Models')
+    logger.info(f'Evaluating Models (parallel_eval={Config.PARALLEL_EVAL})')
     eval_dl_list = []
-    for index in range(Config.N_CLIENTS):
-        if Config.DATASET_TYPE == 'genimage':
-            root_full = os.path.join(Config.PRIVATE_DATASET_DIR, Config.DATASET_LIST[index])
+    for index in party_ids:
+        if Config.DATASET_TYPE in ('genimage', 'diffusionface'):
+            root_full = Config.party_datadir(index)
             test_dl, _ = get_dataloader(
                 dataset=Config.PRIVATE_DATASET_NAME,
                 datadir=root_full,
@@ -461,7 +527,6 @@ def main():
                 train_flag=False
             )
         elif Config.DATASET_TYPE == 'cifar10':
-            # Use distributed test data for each client
             test_dataidx = test_dataidx_map[index] if test_dataidx_map is not None else None
             test_dl, _ = get_cifar10_dataloader(
                 datadir=Config.PRIVATE_DATASET_DIR,
@@ -480,25 +545,54 @@ def main():
                 train_flag=False
             )
         eval_dl_list.append(test_dl)
-    
-    for index in range(Config.N_CLIENTS):
+
+    def evaluate_one_client(index: int):
         test_accuracy_list = []
+        test_auc_list = []
         network = net_list[index]
-        network = nn.DataParallel(network, device_ids=device_ids).to(device)
         netname = Config.PRIVATE_NETS_NAME_LIST[index]
-        
         model_path = (
-            f'./Model_Storage/{Config.PARTICIPANT_PARAMS["loss_function"]}/'
+            f'{getattr(Config, "MODEL_STORAGE_ROOT", "./Model_Storage")}/{Config.PARTICIPANT_PARAMS["loss_function"]}/'
             f'{Config.NOISE_TYPE}{Config.NOISE_RATE}/{netname}_{index}.ckpt'
         )
-        network.load_state_dict(torch.load(model_path))
-        
+        state = torch.load(model_path, map_location='cpu')
+        # Support both plain and legacy DataParallel checkpoints.
+        if any(k.startswith('module.') for k in state.keys()):
+            network = nn.DataParallel(network, device_ids=device_ids).to(device)
+        else:
+            network = network.to(device)
+        network.load_state_dict(state)
+
         for test_dl in eval_dl_list:
-            accuracy = evaluate_network(network, test_dl, device, logger)
+            accuracy, auc = evaluate_network(network, test_dl, device, logger)
             test_accuracy_list.append(accuracy)
-        
+            test_auc_list.append(auc)
+
         avg_accuracy = np.mean(test_accuracy_list)
-        logger.info(f'Average accuracy for {netname}{index}: {avg_accuracy:.2f}%')
+        avg_auc = np.nanmean(test_auc_list)
+        logger.info(
+            f'Average accuracy for {netname}{index}: {avg_accuracy:.2f}%, '
+            f'Average AUC: {avg_auc:.4f}'
+        )
+        metrics_logger.log(
+            phase='cross_eval_avg',
+            client_id=index,
+            accuracy=avg_accuracy,
+            auc=avg_auc,
+        )
+        network = network.cpu()
+        net_list[index] = network.module if isinstance(network, nn.DataParallel) else network
+        torch.cuda.empty_cache()
+        return index
+
+    for chunk in iter_chunks(party_ids, Config.PARALLEL_EVAL):
+        logger.info(f'Eval party chunk: {list(chunk)}')
+        map_parallel(evaluate_one_client, chunk, max_workers=len(chunk))
+        torch.cuda.empty_cache()
+
+    logger.info(f'Pretrain finished. Text log: {logger.logfile}')
+    logger.info(f'Metrics CSV: {metrics_logger.path}')
+    metrics_logger.close()
 
 if __name__ == '__main__':
     main()

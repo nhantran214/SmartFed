@@ -58,7 +58,8 @@ class LossWeightingAgent:
     def __init__(self, 
                  model_name: str = "llama3:8b",
                  base_url: str = "http://localhost:11434",
-                 logger: Optional[logging.Logger] = None):
+                 logger: Optional[logging.Logger] = None,
+                 use_llm: Optional[bool] = None):
         """
         Initialize Loss Weighting Agent
         
@@ -66,6 +67,8 @@ class LossWeightingAgent:
             model_name: LLM model name for Ollama
             base_url: Ollama API base URL
             logger: Logger instance
+            use_llm: Force LLM on/off. False = pure Eq.(26) rule-based (no LLM calls).
+                     None = auto from Ollama availability.
         """
         self.ollama_client = OllamaLLMClient(model_name, base_url)
         self.logger = logger or logging.getLogger(__name__)
@@ -74,6 +77,7 @@ class LossWeightingAgent:
         self.weighting_history = []
         self.effectiveness_history = []
         self.performance_history = []
+        self.fallback_count = 0
         
         # Default strategy
         self.current_strategy = WeightingStrategy(
@@ -90,13 +94,24 @@ class LossWeightingAgent:
         self.memory_size = 50
         self.adaptation_threshold = 0.05
         
-        # Check Ollama availability
-        if not self.ollama_client.is_available():
-            self.logger.warning("Ollama not available, using rule-based weighting")
+        # Resolve use_llm: explicit False never calls LLM (R3-Major-4 rule-based baseline).
+        if use_llm is False:
             self.use_llm = False
+            self.logger.info("Loss Weighting Agent: rule-based Eq.(26) only (use_llm=False)")
+        elif use_llm is True:
+            if not self.ollama_client.is_available():
+                self.logger.warning("Ollama not available; AFWA requested LLM but will use rule-based")
+                self.use_llm = False
+            else:
+                self.logger.info(f"Loss Weighting Agent initialized with {model_name}")
+                self.use_llm = True
         else:
-            self.logger.info(f"Loss Weighting Agent initialized with {model_name}")
-            self.use_llm = True
+            if not self.ollama_client.is_available():
+                self.logger.warning("Ollama not available, using rule-based weighting")
+                self.use_llm = False
+            else:
+                self.logger.info(f"Loss Weighting Agent initialized with {model_name}")
+                self.use_llm = True
     
     def calculate_loss_weighting(self, 
                                context: LossWeightingContext,
@@ -112,9 +127,24 @@ class LossWeightingAgent:
             Optimal loss weighting coefficient
         """
         if self.use_llm:
-            return self._llm_based_weighting(context, client_index)
-        else:
-            return self._rule_based_weighting(context, client_index)
+            return self._clip_coefficient(self._llm_based_weighting(context, client_index))
+        return self._clip_coefficient(self._rule_based_weighting(context, client_index))
+
+    @staticmethod
+    def _coeff_bounds():
+        try:
+            from config import Config as _Cfg
+            lo = float(getattr(_Cfg, 'AFWA_COEFF_MIN', 0.01))
+            hi = float(getattr(_Cfg, 'AFWA_COEFF_MAX', 1.0))
+        except Exception:
+            lo, hi = 0.01, 1.0
+        if lo > hi:
+            lo, hi = hi, lo
+        return lo, hi
+
+    def _clip_coefficient(self, coeff):
+        lo, hi = self._coeff_bounds()
+        return max(lo, min(hi, float(coeff)))
     
     def _llm_based_weighting(self, 
                            context: LossWeightingContext, 
@@ -130,6 +160,13 @@ class LossWeightingAgent:
             
             # Get LLM response
             response = self.ollama_client.generate_response(prompt)
+            if not response:
+                self.logger.warning(
+                    f"Empty LLM response for client {client_index}; using rule-based weighting"
+                )
+                # Empty/timeout already counted in OllamaLLMClient.generate_response.
+                self.fallback_count += 1
+                return self._rule_based_weighting(context, client_index)
             
             # Parse response to get weighting coefficient
             weighting_coeff = self._parse_weighting_response(response, context, client_index)
@@ -139,7 +176,17 @@ class LossWeightingAgent:
             
         except Exception as e:
             self.logger.error(f"Error in LLM-based weighting: {e}")
+            self._mark_fallback()
             return self._rule_based_weighting(context, client_index)
+
+    def _mark_fallback(self):
+        """Count parse/API fallbacks that activate Eq.(26)."""
+        self.fallback_count += 1
+        try:
+            from llm_client_selection import GLOBAL_LLM_COST
+            GLOBAL_LLM_COST.record_parse_fallback()
+        except Exception:
+            pass
     
     def _rule_based_weighting(self, 
                             context: LossWeightingContext, 
@@ -179,7 +226,7 @@ class LossWeightingAgent:
                       convergence_factor * stability_factor)
         
         # Apply bounds
-        final_coeff = max(0.01, min(1.0, final_coeff))
+        final_coeff = self._clip_coefficient(final_coeff)
         
         return final_coeff
     
@@ -228,6 +275,7 @@ All Clients Performance:
                                context_text: str, 
                                client_index: int) -> str:
         """Create prompt for LLM to determine loss weighting"""
+        lo, hi = self._coeff_bounds()
         
         prompt = f"""
 {context_text}
@@ -248,13 +296,13 @@ WEIGHTING CRITERIA:
 6. Efficiency: Balance between performance and communication efficiency
 
 CONSTRAINTS:
-- Coefficient should be between 0.01 and 1.0
+- Coefficient should be between {lo:.2f} and {hi:.2f}
 - Consider the client's performance relative to global average
 - Account for training stability and convergence patterns
 - Maintain diversity in the federated learning process
 
 RESPONSE FORMAT:
-Optimal Coefficient: [value between 0.01 and 1.0]
+Optimal Coefficient: [value between {lo:.2f} and {hi:.2f}]
 Reasoning: [Brief explanation of the decision]
 
 Please determine the optimal loss weighting coefficient for Client {client_index}.
@@ -291,15 +339,17 @@ Please determine the optimal loss weighting coefficient for Client {client_index
             
             # Validate and apply bounds
             if coefficient is not None:
-                coefficient = max(0.01, min(1.0, coefficient))
+                coefficient = self._clip_coefficient(coefficient)
             else:
                 # Fallback to rule-based
+                self._mark_fallback()
                 coefficient = self._rule_based_weighting(context, client_index)
             
             return coefficient
             
         except Exception as e:
             self.logger.warning(f"Error parsing weighting response: {e}")
+            self._mark_fallback()
             return self._rule_based_weighting(context, client_index)
     
     def update_effectiveness(self, 
@@ -380,18 +430,20 @@ Please determine the optimal loss weighting coefficient for Client {client_index
         }
 
 def create_loss_weighting_agent(model_name: str = "llama3:8b",
-                               logger: Optional[logging.Logger] = None) -> LossWeightingAgent:
+                               logger: Optional[logging.Logger] = None,
+                               use_llm: Optional[bool] = None) -> LossWeightingAgent:
     """
     Factory function to create Loss Weighting Agent
     
     Args:
         model_name: LLM model name
         logger: Logger instance
+        use_llm: Force LLM on/off (False = pure rule-based Eq.26 baseline)
         
     Returns:
         LossWeightingAgent instance
     """
-    return LossWeightingAgent(model_name=model_name, logger=logger)
+    return LossWeightingAgent(model_name=model_name, logger=logger, use_llm=use_llm)
 
 # Example usage and testing
 if __name__ == "__main__":

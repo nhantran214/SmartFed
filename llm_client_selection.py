@@ -22,6 +22,7 @@ from datetime import datetime
 import os
 import requests
 import time
+from contextlib import contextmanager
 
 @dataclass
 class ClientMetrics:
@@ -37,14 +38,175 @@ class ClientMetrics:
     resource_availability: float  # 0-1, higher is better
     model_diversity: float  # How different this client's model is from others
 
+
+class LLMCostTracker:
+    """Accumulate LLM call latency / tokens / fallback reasons (R3-Major-4 Table VI)."""
+
+    def __init__(self):
+        self.reset_all()
+
+    def reset_all(self):
+        self.total_calls = 0
+        self.total_success = 0
+        self.total_timeouts = 0
+        self.total_api_errors = 0
+        self.total_empty = 0
+        self.total_parse_fallbacks = 0
+        self.total_selector_fallbacks = 0
+        self.latencies_ms = []
+        self.prompt_tokens = []
+        self.eval_tokens = []
+        self.response_chars = []
+        self._round_calls = 0
+        self._round_success = 0
+        self._round_fallbacks = 0
+        self._round_latencies_ms = []
+        self._round_prompt_tokens = []
+        self._round_eval_tokens = []
+        self._round_response_chars = []
+
+    def reset_round(self):
+        self._round_calls = 0
+        self._round_success = 0
+        self._round_fallbacks = 0
+        self._round_latencies_ms = []
+        self._round_prompt_tokens = []
+        self._round_eval_tokens = []
+        self._round_response_chars = []
+
+    def record_call(
+        self,
+        latency_ms: float,
+        success: bool,
+        empty: bool = False,
+        timeout: bool = False,
+        api_error: bool = False,
+        prompt_tokens: Optional[int] = None,
+        eval_tokens: Optional[int] = None,
+        response_chars: int = 0,
+    ):
+        self.total_calls += 1
+        self._round_calls += 1
+        self.latencies_ms.append(float(latency_ms))
+        self._round_latencies_ms.append(float(latency_ms))
+        if prompt_tokens is not None:
+            self.prompt_tokens.append(int(prompt_tokens))
+            self._round_prompt_tokens.append(int(prompt_tokens))
+        if eval_tokens is not None:
+            self.eval_tokens.append(int(eval_tokens))
+            self._round_eval_tokens.append(int(eval_tokens))
+        self.response_chars.append(int(response_chars))
+        self._round_response_chars.append(int(response_chars))
+        if success and not empty:
+            self.total_success += 1
+            self._round_success += 1
+        if empty:
+            self.total_empty += 1
+            self._round_fallbacks += 1
+        if timeout:
+            self.total_timeouts += 1
+            self._round_fallbacks += 1
+        if api_error:
+            self.total_api_errors += 1
+            self._round_fallbacks += 1
+
+    def record_parse_fallback(self):
+        self.total_parse_fallbacks += 1
+        self._round_fallbacks += 1
+
+    def record_selector_fallback(self):
+        self.total_selector_fallbacks += 1
+        self._round_fallbacks += 1
+
+    @staticmethod
+    def _mean(vals):
+        return float(sum(vals) / len(vals)) if vals else 0.0
+
+    def round_summary(self) -> Dict[str, Any]:
+        calls = self._round_calls
+        fb = self._round_fallbacks
+        return {
+            'calls': calls,
+            'success': self._round_success,
+            'avg_latency_ms': self._mean(self._round_latencies_ms),
+            'fallback_events': fb,
+            'fallback_rate': (fb / calls) if calls else 0.0,
+            'avg_prompt_tokens': self._mean(self._round_prompt_tokens),
+            'avg_eval_tokens': self._mean(self._round_eval_tokens),
+            'avg_response_chars': self._mean(self._round_response_chars),
+        }
+
+    def consume_round_summary(self) -> Dict[str, Any]:
+        summary = self.round_summary()
+        self.reset_round()
+        return summary
+
+    def cumulative_summary(self) -> Dict[str, Any]:
+        calls = self.total_calls
+        fb = (
+            self.total_empty
+            + self.total_timeouts
+            + self.total_api_errors
+            + self.total_parse_fallbacks
+            + self.total_selector_fallbacks
+        )
+        return {
+            'calls': calls,
+            'success': self.total_success,
+            'avg_latency_ms': self._mean(self.latencies_ms),
+            'timeouts': self.total_timeouts,
+            'api_errors': self.total_api_errors,
+            'empty_responses': self.total_empty,
+            'parse_fallbacks': self.total_parse_fallbacks,
+            'selector_fallbacks': self.total_selector_fallbacks,
+            'fallback_events': fb,
+            'fallback_rate': (fb / calls) if calls else 0.0,
+            'avg_prompt_tokens': self._mean(self.prompt_tokens),
+            'avg_eval_tokens': self._mean(self.eval_tokens),
+            'avg_response_chars': self._mean(self.response_chars),
+        }
+
+
+# Process-wide tracker shared by DCSA + AFWA Ollama clients.
+GLOBAL_LLM_COST = LLMCostTracker()
+
+
 class OllamaLLMClient:
     """Client for communicating with Ollama API"""
     
-    def __init__(self, model_name: str = "llama3:8b", base_url: str = "http://localhost:11434"):
+    def __init__(
+        self,
+        model_name: str = "llama3:8b",
+        base_url: str = "http://localhost:11434",
+        cost_tracker: Optional[LLMCostTracker] = None,
+    ):
         self.model_name = model_name
         self.base_url = base_url
         self.api_url = f"{base_url}/api/generate"
         self.logger = logging.getLogger(__name__)
+        self.num_gpu = self._resolve_num_gpu()
+        self.cost_tracker = cost_tracker if cost_tracker is not None else GLOBAL_LLM_COST
+
+    @staticmethod
+    def _resolve_num_gpu() -> int:
+        """Return Ollama ``num_gpu`` layers: 0 = CPU, large N = put layers on GPU."""
+        env_num_gpu = os.environ.get('OLLAMA_NUM_GPU')
+        if env_num_gpu is not None:
+            return int(env_num_gpu)
+        try:
+            from config import Config as _Cfg
+            if getattr(_Cfg, 'OLLAMA_ON_GPU', False):
+                # High value => load as many layers on GPU as VRAM allows.
+                return 999
+            return 0
+        except Exception:
+            return 0
+
+    def refresh_device_policy(self) -> int:
+        """Re-read Config/env (call at the start of each LLM query window)."""
+        self.num_gpu = self._resolve_num_gpu()
+        os.environ['OLLAMA_NUM_GPU'] = str(self.num_gpu)
+        return self.num_gpu
     
     def is_available(self) -> bool:
         """Check if Ollama service is available"""
@@ -53,38 +215,115 @@ class OllamaLLMClient:
             return response.status_code == 200
         except:
             return False
+
+    def unload_model(self) -> None:
+        """Unload the model from Ollama memory (frees GPU/CPU weights)."""
+        if not self.is_available():
+            return
+        try:
+            # keep_alive=0 unloads immediately after this tiny generate.
+            requests.post(
+                self.api_url,
+                json={
+                    "model": self.model_name,
+                    "prompt": ".",
+                    "stream": False,
+                    "keep_alive": 0,
+                    "options": {"num_predict": 1},
+                },
+                timeout=60,
+            )
+        except Exception as e:
+            self.logger.warning(f"Ollama unload request failed: {e}")
+
+    # Back-compat alias used by main/pretrain startup.
+    def unload_from_gpu(self) -> None:
+        self.unload_model()
     
-    def generate_response(self, prompt: str, max_retries: int = 3) -> str:
-        """Generate response from Llama3 model"""
+    def generate_response(self, prompt: str, max_retries: int = None) -> str:
+        """Generate response from Llama3 model (records latency/tokens/fallbacks)."""
+        try:
+            from config import Config as _Cfg
+            timeout = float(getattr(_Cfg, 'OLLAMA_TIMEOUT', 30))
+            if max_retries is None:
+                max_retries = int(getattr(_Cfg, 'OLLAMA_MAX_RETRIES', 3))
+            max_tokens = int(getattr(_Cfg, 'OLLAMA_MAX_TOKENS', 1000))
+        except Exception:
+            timeout = 30.0
+            if max_retries is None:
+                max_retries = 3
+            max_tokens = 1000
+
+        # Honor current Config each call (timeshare GPU/CPU).
+        num_gpu = self.refresh_device_policy()
+        tracker = self.cost_tracker
+
         for attempt in range(max_retries):
+            t0 = time.perf_counter()
             try:
                 payload = {
                     "model": self.model_name,
                     "prompt": prompt,
                     "stream": False,
+                    # Keep loaded briefly across serial client queries in one round.
+                    "keep_alive": "5m",
                     "options": {
                         "temperature": 0.7,
                         "top_p": 0.9,
-                        "max_tokens": 1000
+                        "num_predict": max_tokens,
+                        "num_gpu": num_gpu,
                     }
                 }
                 
                 response = requests.post(
                     self.api_url,
                     json=payload,
-                    timeout=30
+                    timeout=timeout
                 )
+                latency_ms = (time.perf_counter() - t0) * 1000.0
                 
                 if response.status_code == 200:
                     result = response.json()
-                    return result.get("response", "").strip()
+                    text = (result.get("response", "") or "").strip()
+                    prompt_tok = result.get("prompt_eval_count")
+                    eval_tok = result.get("eval_count")
+                    # Prefer Ollama's own total_duration (ns) when present.
+                    total_ns = result.get("total_duration")
+                    if isinstance(total_ns, (int, float)) and total_ns > 0:
+                        latency_ms = float(total_ns) / 1e6
+                    tracker.record_call(
+                        latency_ms=latency_ms,
+                        success=bool(text),
+                        empty=not bool(text),
+                        prompt_tokens=prompt_tok,
+                        eval_tokens=eval_tok,
+                        response_chars=len(text),
+                    )
+                    return text
                 else:
                     self.logger.warning(f"Ollama API error: {response.status_code}")
+                    tracker.record_call(
+                        latency_ms=latency_ms,
+                        success=False,
+                        api_error=True,
+                    )
                     
             except requests.exceptions.Timeout:
-                self.logger.warning(f"Ollama API timeout (attempt {attempt + 1})")
+                latency_ms = (time.perf_counter() - t0) * 1000.0
+                self.logger.warning(f"Ollama API timeout (attempt {attempt + 1}/{max_retries})")
+                tracker.record_call(
+                    latency_ms=latency_ms,
+                    success=False,
+                    timeout=True,
+                )
             except Exception as e:
-                self.logger.warning(f"Ollama API error (attempt {attempt + 1}): {e}")
+                latency_ms = (time.perf_counter() - t0) * 1000.0
+                self.logger.warning(f"Ollama API error (attempt {attempt + 1}/{max_retries}): {e}")
+                tracker.record_call(
+                    latency_ms=latency_ms,
+                    success=False,
+                    api_error=True,
+                )
             
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)  # Exponential backoff
@@ -225,7 +464,7 @@ Please select the best {selection_budget} clients from the available clients: {a
                 selected_clients = [int(n) for n in numbers if int(n) in available_clients]
             
             # Validate and limit to selection budget
-            selected_clients = [c for c in selected_clients if c in available_clients]
+            selected_clients = [int(c) for c in selected_clients if int(c) in available_clients]
             selected_clients = selected_clients[:selection_budget]
             
             # If still not enough, add random clients
@@ -240,6 +479,50 @@ Please select the best {selection_budget} clients from the available clients: {a
             self.logger.warning(f"Error parsing LLM response: {e}")
             # Fallback to random selection
             return random.sample(available_clients, min(selection_budget, len(available_clients)))
+
+
+@contextmanager
+def ollama_inference_session(ollama_client: Optional['OllamaLLMClient'] = None,
+                             logger: Optional[logging.Logger] = None):
+    """Run a short LLM window, optionally on GPU, then unload to free VRAM for training.
+
+    Pass ``ollama_client=None`` to skip the session entirely (rule-based / W/o MA).
+
+    Usage::
+        with ollama_inference_session(client, logger):
+            coef = agent.calculate_loss_weighting(...)
+    """
+    log = logger or logging.getLogger(__name__)
+    if ollama_client is None:
+        yield None
+        return
+    client = ollama_client
+    num_gpu = client.refresh_device_policy()
+    device_label = 'GPU' if num_gpu > 0 else 'CPU'
+    log.info(f'Ollama inference session start ({device_label}, num_gpu={num_gpu})')
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        yield client
+    finally:
+        unload = True
+        try:
+            from config import Config as _Cfg
+            unload = bool(getattr(_Cfg, 'OLLAMA_UNLOAD_AFTER_QUERY', True))
+        except Exception:
+            pass
+        if unload:
+            log.info('Unloading Ollama model to free VRAM for training')
+            client.unload_model()
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
 
 @dataclass
 class SelectionContext:
@@ -435,6 +718,7 @@ class OllamaLLMSelector(LLMClientSelector):
         
         if not self.use_ollama:
             self.logger.info("Using fallback selector (Ollama not available)")
+            GLOBAL_LLM_COST.record_selector_fallback()
             return self.fallback_selector.select_clients(context, reward_scores)
         
         try:
@@ -449,6 +733,7 @@ class OllamaLLMSelector(LLMClientSelector):
         except Exception as e:
             self.logger.error(f"Error in Ollama selection: {e}")
             self.logger.info("Falling back to adaptive selector")
+            GLOBAL_LLM_COST.record_selector_fallback()
             return self.fallback_selector.select_clients(context, reward_scores)
 
 class AdaptiveLLMSelector(LLMClientSelector):

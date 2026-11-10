@@ -1,6 +1,27 @@
-data
-Logs
-Model_Storage
-Model_Storage_main
-main.py
-__pycache__
+# Datasets are downloaded separately (see README). Do not commit them.
+data/
+
+# Training logs and checkpoints (pretrain.py / main.py write these locally).
+Logs/
+Model_Storage*/
+*.ckpt
+*.pth
+*.pt
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Editor and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local image cache used by Dataset/image_cache.py
+**/.cache/
+.gitignore
